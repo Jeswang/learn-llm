@@ -9,9 +9,10 @@ BATCH_SIZE = 32     # Number of sequences processed in parallel
 with open('names.txt', 'r') as f:
     names = f.read().strip().split('\n')
 BLOCK_SIZE = max(len(n) for n in names) + 1  # max name length + 1 for END token
-N_EMBD = 32         # Dimension of the embedding vector for each token
-N_HEAD = 2          # Number of attention heads
-HEAD_SIZE = N_EMBD // N_HEAD  # 16 per head, concatenated = 32 = N_EMBD
+N_EMBD = 64         # Dimension of the embedding vector for each token
+N_HEAD = 4          # Number of attention heads
+HEAD_SIZE = N_EMBD // N_HEAD  # 16 per head, concatenated = 64 = N_EMBD
+DROPOUT = 0.2       # Dropout rate: randomly zero out 20% of neurons during training
 
 def apply_rope(x, head_size):
     """Apply Rotary Position Embeddings to a (B, T, head_size) tensor."""
@@ -40,6 +41,7 @@ class Head(nn.Module):
         self.query = nn.Linear(N_EMBD, head_size, bias=False)
         self.value = nn.Linear(N_EMBD, head_size, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones(BLOCK_SIZE, BLOCK_SIZE)))
+        self.dropout = nn.Dropout(DROPOUT)
 
     def forward(self, x):
         B, T, C = x.shape
@@ -55,6 +57,7 @@ class Head(nn.Module):
         wei = wei * k.shape[-1]**-0.5
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
         wei = F.softmax(wei, dim=-1)
+        wei = self.dropout(wei)
         out = wei @ v
         return out
 
@@ -66,11 +69,11 @@ class MultiHeadAttention(nn.Module):
         self.heads = nn.ModuleList([Head(head_size) for _ in range(n_heads)])
         # Project concatenated output back to N_EMBD
         self.proj = nn.Linear(n_heads * head_size, N_EMBD)
+        self.dropout = nn.Dropout(DROPOUT)
 
     def forward(self, x):
-        # Run each head independently, concatenate along last dim
-        out = torch.cat([h(x) for h in self.heads], dim=-1)  # (B, T, N_EMBD)
-        out = self.proj(out)  # (B, T, N_EMBD)
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.dropout(self.proj(out))
         return out
 
 class MLP(nn.Module):
@@ -82,6 +85,7 @@ class MLP(nn.Module):
             nn.Linear(N_EMBD, 4 * N_EMBD),
             nn.GELU(),
             nn.Linear(4 * N_EMBD, N_EMBD),
+            nn.Dropout(DROPOUT),
         )
 
     def forward(self, x):
@@ -188,8 +192,21 @@ class Model(nn.Module):
             loss = (loss_per_token * mask).sum() / mask.sum()
         return logits, loss
 
+MAX_STEPS = 20000
+WARMUP_STEPS = 200
+MAX_LR = 1e-3
+MIN_LR = 1e-4
+
 model = Model()
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+optimizer = torch.optim.AdamW(model.parameters(), lr=MAX_LR, weight_decay=0.01)
+
+import math
+def get_lr(step):
+    """Warmup then cosine decay."""
+    if step < WARMUP_STEPS:
+        return MAX_LR * step / WARMUP_STEPS
+    progress = (step - WARMUP_STEPS) / (MAX_STEPS - WARMUP_STEPS)
+    return MIN_LR + 0.5 * (MAX_LR - MIN_LR) * (1 + math.cos(math.pi * progress))
 
 # --- Evaluation ---
 
@@ -211,16 +228,46 @@ def estimate_loss(eval_iters=50):
 # --- Training ---
 
 print("\nTraining...")
-for step in range(5000):
-    if step % 100 == 0:
+for step in range(MAX_STEPS):
+    if step % 500 == 0:
         losses = estimate_loss()
-        print(f"step {step:4d} | train loss: {losses['train']:.4f} | test loss: {losses['test']:.4f}")
+        print(f"step {step:5d} | train loss: {losses['train']:.4f} | test loss: {losses['test']:.4f}")
+
+    # Update learning rate
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
 
     x, y, mask = get_batch('train')
     _, loss = model(x, y, mask)
     optimizer.zero_grad()
     loss.backward()
+    # Gradient clipping: prevent exploding gradients
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     optimizer.step()
 
 losses = estimate_loss()
-print(f"step 5000 | train loss: {losses['train']:.4f} | test loss: {losses['test']:.4f}")
+print(f"step 20000 | train loss: {losses['train']:.4f} | test loss: {losses['test']:.4f}")
+
+# --- Generate names ---
+
+@torch.no_grad()
+def generate(num_names=20):
+    model.eval()
+    for _ in range(num_names):
+        idx = torch.zeros((1, 1), dtype=torch.long)  # start with PAD token
+        name = []
+        for _ in range(BLOCK_SIZE - 1):
+            logits, _ = model(idx)
+            probs = F.softmax(logits[:, -1, :], dim=-1)  # last token's prediction
+            next_token = torch.multinomial(probs, num_samples=1)
+            if next_token.item() == END_TOKEN:
+                break
+            if next_token.item() != PAD_TOKEN:
+                name.append(itos[next_token.item()])
+            idx = torch.cat([idx, next_token], dim=1)
+        print(''.join(name))
+    model.train()
+
+print("\nGenerated names:")
+generate(20)
